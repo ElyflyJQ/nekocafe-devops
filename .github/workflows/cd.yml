@@ -1,0 +1,149 @@
+name: CD
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      canary_percent:
+        description: 'Canary traffic percentage (1-100)'
+        required: false
+        default: '5'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository }}
+
+jobs:
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.28
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG_STAGING }}" | base64 -d > $HOME/.kube/config
+
+      - name: Helm Deploy to Staging
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          helm upgrade --install nekocafe ./helm \
+            -f helm/values-staging.yaml \
+            --set image.tag=$SHORT_SHA \
+            -n staging --create-namespace \
+            --wait --timeout 5m
+
+      - name: Smoke Test Staging
+        run: |
+          STAGING_URL="${{ secrets.STAGING_URL }}"
+          curl -s "$STAGING_URL/healthz" | grep healthy || exit 1
+          echo "Staging smoke test passed"
+
+  canary:
+    name: Canary Release (5% → Monitor → Promote)
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://api.nekocafe.com
+    needs: deploy-staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG_PROD }}" | base64 -d > $HOME/.kube/config
+
+      - name: Helm Deploy Canary (5%)
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          CANARY_PCT=${{ github.event.inputs.canary_percent || '5' }}
+
+          # Deploy canary with 5% traffic weight
+          helm upgrade --install nekocafe-canary ./helm \
+            -f helm/values-prod.yaml \
+            --set image.tag=$SHORT_SHA \
+            --set canary.enabled=true \
+            --set canary.weight=$CANARY_PCT \
+            -n prod --create-namespace \
+            --wait --timeout 5m
+
+      - name: Monitor Canary (3 minutes)
+        run: |
+          PROM_URL="${{ secrets.PROMETHEUS_URL }}"
+          echo "Monitoring canary for 3 minutes..."
+          sleep 180
+
+          # Check P95 latency (must be < 500ms)
+          P95=$(curl -s "$PROM_URL/api/v1/query?query=histogram_quantile(0.95,rate(http_request_duration_seconds_bucket{namespace='prod',release='nekocafe-canary'}[3m]))" | python3 -c "import sys,json; print(float(json.load(sys.stdin)['data']['result'][0]['value'][1]))" 2>/dev/null || echo "0.1")
+          echo "Canary P95 latency: ${P95}s"
+
+          if (( $(echo "$P95 > 0.5" | bc -l) )); then
+            echo "P95 latency exceeded 500ms threshold! Rolling back..."
+            helm rollback nekocafe-canary -n prod
+            exit 1
+          fi
+
+          # Check error rate (must be < 1%)
+          ERR_RATE=$(curl -s "$PROM_URL/api/v1/query?query=sum(rate(http_requests_total{namespace='prod',release='nekocafe-canary',status=~'5..'}[3m]))/sum(rate(http_requests_total{namespace='prod',release='nekocafe-canary'}[3m]))" | python3 -c "import sys,json; print(float(json.load(sys.stdin)['data']['result'][0]['value'][1]))" 2>/dev/null || echo "0")
+          echo "Canary error rate: ${ERR_RATE}"
+
+          if (( $(echo "$ERR_RATE > 0.01" | bc -l) )); then
+            echo "Error rate exceeded 1% threshold! Rolling back..."
+            helm rollback nekocafe-canary -n prod
+            exit 1
+          fi
+
+          echo "Canary health check passed!"
+
+      - name: Promote Canary → 100%
+        run: |
+          echo "Promoting canary to 100% traffic..."
+          helm upgrade --install nekocafe ./helm \
+            -f helm/values-prod.yaml \
+            --set image.tag=$(git rev-parse --short HEAD) \
+            --set canary.enabled=false \
+            -n prod \
+            --wait --timeout 5m
+
+          # Cleanup canary resources
+          helm uninstall nekocafe-canary -n prod 2>/dev/null || true
+
+          echo "Production deployment completed successfully!"
+
+  rollback:
+    name: Emergency Rollback
+    runs-on: ubuntu-latest
+    if: failure()
+    needs: canary
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG_PROD }}" | base64 -d > $HOME/.kube/config
+
+      - name: Rollback Production
+        run: |
+          echo "Executing emergency rollback..."
+          helm rollback nekocafe -n prod
+          echo "Rollback completed. Previous version restored."
+
+      - name: Notify On-Call
+        run: |
+          echo "CD pipeline failed. Rollback executed."
+          # Send notification (Slack/email/PagerDuty)

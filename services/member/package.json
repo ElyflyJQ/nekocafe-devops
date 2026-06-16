@@ -1,0 +1,31 @@
+{
+  "name": "nekocafe-member-service",
+  "version": "1.0.0",
+  "description": "NekoCafé Member & Loyalty Service",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "jest --coverage --forceExit",
+    "lint": "eslint src/ tests/"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "uuid": "^10.0.0",
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/sdk-trace-node": "^1.25.0",
+    "@opentelemetry/sdk-trace-base": "^1.25.0",
+    "@opentelemetry/exporter-trace-otlp-grpc": "^0.52.0",
+    "@opentelemetry/instrumentation": "^0.52.0",
+    "@opentelemetry/instrumentation-express": "^0.41.0"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "eslint": "^8.57.0",
+    "supertest": "^7.0.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "collectCoverageFrom": ["src/**/*.js"]
+  }
+}

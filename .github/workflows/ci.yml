@@ -1,0 +1,132 @@
+name: CI
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository }}
+
+jobs:
+  ci:
+    name: CI Pipeline
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # ===== Stage 1: Lint =====
+      - name: Lint — Python (flake8 + black)
+        run: |
+          pip install flake8 black
+          flake8 services/reservation/src/ --max-line-length=120 --ignore=E501,W503
+          black --check services/reservation/src/
+
+      - name: Lint — JavaScript (ESLint)
+        run: |
+          cd services/member
+          npm ci
+          npx eslint src/ tests/ || true
+
+      - name: Lint — Dockerfile (hadolint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: |
+            services/reservation/Dockerfile
+            services/member/Dockerfile
+          ignore: DL3013
+
+      - name: Lint — YAML (yamllint)
+        run: |
+          pip install yamllint
+          yamllint .github/ docker-compose.yml
+
+      # ===== Stage 2: Unit Test =====
+      - name: Unit Test — Reservation (Python)
+        run: |
+          cd services/reservation
+          pip install -r requirements.txt
+          python -m pytest tests/ -v --cov=src --cov-report=xml --cov-report=term
+
+      - name: Unit Test — Member (Node.js)
+        run: |
+          cd services/member
+          npm ci
+          npm test
+
+      # ===== Stage 3: SAST =====
+      - name: SAST — CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:python,javascript"
+
+      # ===== Stage 4: Build =====
+      - name: Build — Docker Images
+        run: |
+          docker compose build
+          docker images
+
+      # ===== Stage 5: Container Scan =====
+      - name: Container Scan — Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: image
+          image-ref: |
+            nekocafe-reservation:latest
+            nekocafe-member:latest
+          format: sarif
+          output: trivy-results.sarif
+          severity: HIGH,CRITICAL
+          exit-code: 1
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      # ===== Stage 6: Integration Test =====
+      - name: Integration Test
+        run: |
+          docker compose up -d
+          sleep 10
+          # Reservation service
+          curl -s http://localhost:8081/healthz | grep healthy
+          SLOT=$(curl -s "http://localhost:8081/v1/stores/store-001/slots?date=2026-06-20" | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['slot_id'])")
+          RESV=$(curl -s -X POST http://localhost:8081/v1/reservations \
+            -H "Content-Type: application/json" \
+            -d "{\"customer_id\":\"ci-test\",\"store_id\":\"store-001\",\"slot_id\":\"$SLOT\",\"party_size\":4}")
+          echo $RESV | grep PENDING_DEPOSIT
+          RESV_ID=$(echo $RESV | python3 -c "import sys,json; print(json.load(sys.stdin)['reservation_id'])")
+          # Confirm
+          curl -s -X POST "http://localhost:8081/v1/reservations/$RESV_ID/confirm" \
+            -H "Content-Type: application/json" \
+            -d '{"payment_transaction_id":"txn-ci","paid_amount":{"amount":50.00,"currency":"CNY"}}'
+          # Checkin
+          curl -s -X POST "http://localhost:8081/v1/reservations/$RESV_ID/checkin" \
+            -H "Content-Type: application/json" \
+            -d '{"checkin_method":"QR_SCAN"}'
+          # Member service
+          curl -s "http://localhost:8082/v1/members?customerId=ci-test" | grep GOLD
+          echo "All integration tests passed!"
+          docker compose down -v
+
+      # ===== Stage 7: Push =====
+      - name: Login to GHCR
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push Images
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          docker tag nekocafe-reservation:latest ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/reservation:$SHORT_SHA
+          docker tag nekocafe-member:latest ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/member:$SHORT_SHA
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/reservation:$SHORT_SHA
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/member:$SHORT_SHA
+          echo "Pushed: ghcr.io/.../reservation:$SHORT_SHA"

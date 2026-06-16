@@ -1,0 +1,1 @@
+"""NekoCafé Reservation Service."""
