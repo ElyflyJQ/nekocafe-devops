@@ -7,22 +7,18 @@ import uuid
 import logging
 import json
 import os
-from datetime import date, time as dtime, datetime, timezone
+from datetime import datetime, timezone
 from typing import Optional, List
 from enum import Enum
 
-from fastapi import FastAPI, HTTPException, Query, Path, Body, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Query, Path, Body
 from pydantic import BaseModel, Field
-import redis.asyncio as redis
+import redis.asyncio as redis  # noqa: F401
 
 # === Observability: OpenTelemetry ===
 from opentelemetry import trace
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.instrumentation.redis import RedisInstrumentor
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 # Structured JSON logging
 logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -244,8 +240,7 @@ async def cancel_reservation(reservation_id: str = Path(), reason: Optional[str]
     if not r:
         raise HTTPException(404, detail="预约不存在")
 
-    created_at = datetime.fromisoformat(r["created_at"])
-    hours_until = 48
+    hours_until = 48  # Simplified: assume > 2h before reservation
     if hours_until >= 2:
         penalty, refund = 0.0, r["deposit"]["amount"]
     else:

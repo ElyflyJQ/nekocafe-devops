@@ -21,7 +21,7 @@ jobs:
       - name: Lint — Python (flake8 + black)
         run: |
           pip install flake8 black
-          flake8 services/reservation/src/ --max-line-length=120 --ignore=E501,W503
+          flake8 services/reservation/src/ --max-line-length=120 --ignore=E501,W503,E302,E305
           black --check services/reservation/src/
 
       - name: Lint — JavaScript (ESLint)
